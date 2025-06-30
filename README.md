@@ -1,4 +1,4 @@
-# Nexus-cli Mac批量版(基于官方0.8.14更新)
+# Nexus-cli Mac批量版(基于官方0.8.14更新)  先别用，有点问题
 Linux版：https://github.com/huahua1220/nexus-cli-linux
 
 有问题联系推特：https://x.com/hua_web3
