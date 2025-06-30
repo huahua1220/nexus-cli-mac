@@ -1,6 +1,6 @@
 [package]
 name = "nexus-network"
-version = "0.7.9"
+version = "0.8.14"
 edition = "2021"
 rust-version = "1.75"
 build = "build.rs"
@@ -19,9 +19,9 @@ opt-level = 1
 lto = "fat"
 strip = true
 codegen-units = 1
-# 内存优化配置
-panic = "abort"           # 减少二进制大小和内存使用
-overflow-checks = false   # 减少运行时检查
+
+panic = "abort"          
+overflow-checks = false   
 
 [profile.ci-build]
 inherits = "dev"

@@ -102,3 +102,35 @@ impl NodeType {
         }
     }
 }
+
+/// Request multiple tasks
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTasksRequest {
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+
+/// Response containing multiple tasks
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTasksResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub tasks: ::prost::alloc::vec::Vec<Task>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+
+/// Single task in batch response
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Task {
+    #[prost(string, tag = "1")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub program_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub public_inputs: ::prost::alloc::vec::Vec<u8>,
+}

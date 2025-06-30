@@ -1,9 +1,10 @@
 use nexus_sdk::{stwo::seq::Stwo, Local, Prover, KnownExitCodes, Viewable};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use lazy_static::lazy_static;
+use crate::task_pool::TaskPool;
 
 use crate::orchestrator_client::OrchestratorClient;
 use crate::{analytics, environment::Environment, keys};
@@ -525,78 +526,152 @@ async fn run_authenticated_proving_loop_with_callback<F>(
     node_id: u64,
     environment: Environment,
     _prefix: String,
-    proof_interval: u64,
+    _proof_interval: u64,
     status_callback: F,
 ) -> Result<(), ProverError> 
 where
     F: Fn(String) + Send + Sync + 'static,
 {
     let orchestrator_client = OrchestratorClient::new(environment);
-    let prover = get_or_create_prover().await?;
+    let _prover = get_or_create_prover().await?;
+    let task_pool = Arc::new(TaskPool::new(100));
+    
     let mut proof_count = 1;
-    let mut consecutive_failures = 0;
+    let mut _consecutive_failures = 0;
+    let mut fetch_existing_tasks = true;
+    let mut last_batch_fetch = Instant::now() - Duration::from_secs(10);
     
     loop {
-        const MAX_ATTEMPTS: usize = 5;
-        let mut attempt = 1;
-        let mut success = false;
-
-        while attempt <= MAX_ATTEMPTS {
-            let current_prover = prover.clone();
-            match authenticated_proving(node_id, &orchestrator_client, current_prover.clone()).await {
-                Ok(_) => {
-                    success = true;
-                    break;
-                }
-                Err(ProverError::RateLimited(msg)) => {
-                    status_callback(format!("🚫 Rate limited: {} - waiting 60s", msg));
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    attempt += 1;
-                    if attempt <= MAX_ATTEMPTS {
-                        continue; // Retry instead of exit
+        // Batch fetch logic
+        if fetch_existing_tasks && last_batch_fetch.elapsed() >= Duration::from_secs(3) {
+            // Extract data immediately to avoid holding non-Send types across await
+            let (tasks_option, should_retry_after_rate_limit) = match orchestrator_client.get_tasks_batch(&node_id.to_string()).await {
+                Ok(tasks) => {
+                    if tasks.is_empty() {
+                        (None, false)
+                    } else {
+                        (Some(tasks), false)
                     }
-                    break;
                 }
                 Err(e) => {
-                    status_callback(format!("⚠️ Attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e));
-                    attempt += 1;
-                    if attempt <= MAX_ATTEMPTS {
-                        status_callback(format!("🔄 Retrying in 2s..."));
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    let is_rate_limited = e.contains("RATE_LIMITED");
+                    if is_rate_limited {
+                        status_callback(format!("🚫 Fetch task fail - waiting 60s"));
+                        (None, true)
+                    } else {
+                        status_callback(format!("⚠️ Fetch task fail"));
+                        (None, false)
                     }
+                }
+            };
+            
+            // Process tasks if available
+            if let Some(tasks) = tasks_option {
+                let added = task_pool.add_tasks(tasks).await;
+                let pool_size = task_pool.len().await;
+                status_callback(format!("📥 Get {} tasks [tasks:{}]", added, pool_size));
+                fetch_existing_tasks = false;
+            }
+            
+            // Handle rate limiting sleep
+            if should_retry_after_rate_limit {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                fetch_existing_tasks = true;
+            }
+            
+            last_batch_fetch = Instant::now();
+        }
+
+        // Task processing logic
+        if task_pool.len().await < 3 {
+            fetch_existing_tasks = true;
+        }
+        
+        let task_to_process = if let Some(pooled_task) = task_pool.get_task().await {
+            Some(pooled_task)
+        } else {
+            // Fallback to single task mode - extract data immediately
+            let (task_option, should_sleep_rate_limit, should_sleep_error) = match orchestrator_client.get_task(&node_id.to_string()).await {
+                Ok(task) => (Some(task), false, false),
+                Err(e) => {
+                    let is_rate_limited = e.to_string().contains("RATE_LIMITED");
+                    if is_rate_limited {
+                        status_callback(format!("🚫 Rate limited - waiting 60s"));
+                        (None, true, false)
+                    } else {
+                        status_callback(format!("⚠️ Fetch task fail"));
+                        _consecutive_failures += 1;
+                        (None, false, true)
+                    }
+                }
+            };
+            
+            // Handle sleeps
+            if should_sleep_rate_limit {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                fetch_existing_tasks = true;
+            } else if should_sleep_error {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            
+            task_option
+        };
+
+        if let Some(task) = task_to_process {
+            // Process the task
+            status_callback(format!("💻 Compute completed"));
+            
+            match prove_with_task(&task) {
+                Ok(proof) => {
+                    let proof_hash = format!("{:x}", sha3::Keccak256::digest(&proof));
+                    let signing_key = crate::keys::load_or_generate_signing_key()
+                        .map_err(|e| ProverError::Orchestrator(format!("Failed to load signing key: {}", e)))?;
+                    
+                    // Extract result data immediately without holding Result type
+                    let (submit_success, should_retry_submit) = match orchestrator_client.submit_proof_with_signature(&task.task_id, &proof_hash, proof, signing_key).await {
+                        Ok(_) => (true, false),
+                        Err(e) => {
+                            let is_rate_limited = e.to_string().contains("RATE_LIMITED");
+                            if is_rate_limited {
+                                status_callback(format!("🚫 Submit fail - waiting 60s"));
+                                (false, true)
+                            } else {
+                                status_callback(format!("❌ Submit fail"));
+                                _consecutive_failures += 1;
+                                (false, false)
+                            }
+                        }
+                    };
+                    
+                    // Handle success case with awaits outside match
+                    if submit_success {
+                        task_pool.mark_completed(&task.task_id).await;
+                        let pool_size = task_pool.len().await;
+                        status_callback(format!("✅ Proof #{} submitted [tasks:{}]", proof_count, pool_size));
+                        _consecutive_failures = 0;
+                        proof_count += 1;
+                    }
+                    
+                    // Handle rate limiting sleep
+                    if should_retry_submit {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        fetch_existing_tasks = true;
+                    }
+                }
+                Err(e) => {
+                    status_callback(format!("❌ Compute failed: {}", e));
+                    _consecutive_failures += 1;
                 }
             }
         }
 
-        if success {
-            consecutive_failures = 0;
-            status_callback(format!("✅ Proof #{} completed successfully", proof_count));
-            proof_count += 1;
+        // Sleep interval: batch mode 3s, single task mode 500ms
+        let sleep_duration = if fetch_existing_tasks {
+            Duration::from_millis(3000)
         } else {
-            consecutive_failures += 1;
-            status_callback(format!("❌ Proof #{} failed after {} attempts (retry {}/∞)", 
-                proof_count, MAX_ATTEMPTS, consecutive_failures));
-            
-            // Infinite retry, wait 10 seconds after failure
-            status_callback(format!("🔄 Waiting 10s before retry..."));
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            continue; // Don't increment proof_count, retry same proof
-        }
-
-        let client_id = format!("{:x}", md5::compute(node_id.to_le_bytes()));
-        analytics::track(
-            "cli_proof_node_v2".to_string(),
-            format!("Completed proof iteration #{}", proof_count),
-            serde_json::json!({
-                "node_id": node_id,
-                "proof_count": proof_count,
-            }),
-            false,
-            &environment,
-            client_id.clone(),
-        );
-        
-        tokio::time::sleep(Duration::from_secs(proof_interval)).await;
+            Duration::from_millis(500)
+        };
+        tokio::time::sleep(sleep_duration).await;
     }
 }
 

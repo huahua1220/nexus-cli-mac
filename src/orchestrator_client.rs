@@ -5,6 +5,7 @@
 use crate::environment;
 use crate::nexus_orchestrator::{
     GetProofTaskRequest, GetProofTaskResponse, NodeType, SubmitProofRequest,
+    GetTasksRequest, GetTasksResponse,
 };
 use crate::utils::system::{get_memory_info, measure_gflops};
 use crate::task::Task;
@@ -133,6 +134,58 @@ impl OrchestratorClient {
     pub async fn get_task(&self, node_id: &str) -> Result<Task, Box<dyn std::error::Error>> {
         let response = self.get_proof_task(node_id).await?;
         Ok(Task::from(&response))
+    }
+
+    /// Get multiple tasks in batch
+    pub async fn get_tasks_batch(&self, node_id: &str) -> Result<Vec<crate::task::Task>, String> {
+        let request = GetTasksRequest {
+            node_id: node_id.to_string(),
+            next_cursor: "".to_string(),
+        };
+
+        let url = format!("{}/v3/tasks", self.base_url);
+        let request_bytes = request.encode_to_vec();
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(request_bytes)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let friendly_message = match status.as_u16() {
+                400 => "Bad request".to_string(),
+                401 => "Authentication failed".to_string(),
+                403 => "Forbidden".to_string(),
+                404 => "Submit fail".to_string(),
+                408 => "Request timeout".to_string(),
+                429 => return Err(format!("RATE_LIMITED:Rate limited")),
+                502 => "Server error".to_string(),
+                504 => "Gateway timeout".to_string(),
+                500..=599 => format!("Server error {}", status),
+                _ => format!("Unknown error {}", status),
+            };
+            return Err(friendly_message);
+        }
+
+        let response_bytes = response.bytes().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        let get_tasks_response = GetTasksResponse::decode(response_bytes)
+            .map_err(|e| format!("Failed to decode batch tasks response: {}", e))?;
+
+        let tasks = get_tasks_response.tasks.iter().map(|proto_task| {
+            crate::task::Task {
+                task_id: proto_task.task_id.clone(),
+                program_id: proto_task.program_id.clone(),
+                public_inputs: proto_task.public_inputs.clone(),
+            }
+        }).collect();
+
+        Ok(tasks)
     }
 
     #[allow(dead_code)]

@@ -27,6 +27,7 @@ mod orchestrator_client;
 mod prover;
 mod setup;
 mod task;
+mod task_pool;
 mod ui;
 mod utils;
 mod node_list;
